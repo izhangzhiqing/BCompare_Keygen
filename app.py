@@ -1,9 +1,10 @@
 import uvicorn
 from html import escape
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, File, UploadFile, Form, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from lic_manager import LicenseEncoder, LicenseDecoder, check_serial
+from binpatch_core import parse_find_replace, compute_patch
 
 app = FastAPI()
 
@@ -212,6 +213,17 @@ async def get_bcom_css():
     .copy-btn:hover {
         background-color: #0b7dda;
     }
+    .topnav {
+        text-align: center;
+        margin-bottom: 12px;
+    }
+    .topnav a {
+        color: #2196F3;
+        text-decoration: none;
+    }
+    .topnav a:hover {
+        text-decoration: underline;
+    }
     """
     return HTMLResponse(content=css_content, media_type="text/css")
 
@@ -226,6 +238,7 @@ async def get_bcom_key_generator_page():
         <link rel="stylesheet" href="/css/bcom.css">
     </head>
     <body>
+        <div class="topnav"><a href="/binpatch">二进制文件查找 / 替换工具 &rarr;</a></div>
         <h1>密钥生成器</h1>
         <div class="container">
             <form id="keyForm">
@@ -300,6 +313,205 @@ async def gen_bcom_key(req: KeyRequest):
             "random": rand
         }
     }
+
+
+# ---------------------------------------------------------------------------
+# 通用二进制文件查找/替换工具（与授权无关，纯字节级处理）
+# ---------------------------------------------------------------------------
+
+@app.get("/binpatch", response_class=HTMLResponse)
+async def get_binpatch_page():
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <title>二进制查找替换</title>
+        <link rel="stylesheet" href="/css/bcom.css">
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 820px; margin: 0 auto; padding: 20px; color: #333; }
+            h1 { color: #333; text-align: center; }
+            .container { background-color: #f5f5f5; padding: 20px; border-radius: 5px; }
+            .form-group { margin-bottom: 15px; }
+            label { display: block; margin-bottom: 5px; font-weight: bold; }
+            input[type=text], select, textarea {
+                width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;
+                box-sizing: border-box; font-family: Consolas, Monaco, monospace;
+            }
+            .row { display: flex; gap: 12px; }
+            .row > div { flex: 1; }
+            button {
+                color: white; padding: 10px 15px; border: none; border-radius: 4px;
+                cursor: pointer; font-size: 15px;
+            }
+            .btn-primary { background-color: #4CAF50; }
+            .btn-primary:hover { background-color: #45a049; }
+            .btn-secondary { background-color: #2196F3; }
+            .btn-secondary:hover { background-color: #0b7dda; }
+            .btn-row { display: flex; gap: 12px; margin-top: 10px; }
+            #countResult { margin-top: 10px; padding: 10px; background-color: #e8f5e9; border-radius: 4px; display: none; }
+            .hint { color: #666; font-size: 12px; margin-top: 2px; }
+            .checkbox-row { display: flex; align-items: center; gap: 6px; }
+            .checkbox-row input { width: auto; }
+            .radio-row { display: flex; align-items: center; gap: 20px; margin-top: 4px; }
+            .radio-item { display: flex; align-items: center; gap: 6px; font-weight: normal; margin: 0; }
+            .radio-item input { width: auto; }
+        </style>
+    </head>
+    <body>
+        <div class="topnav"><a href="/">&larr; 返回密钥生成器</a></div>
+        <h1>二进制文件查找 / 替换</h1>
+        <div class="container">
+            <form id="bpForm" method="post" action="/binpatch/process" enctype="multipart/form-data">
+                <div class="form-group">
+                    <label for="file">选择文件：</label>
+                    <input type="file" id="file" name="file" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="mode">匹配模式：</label>
+                    <select id="mode" name="mode" onchange="onModeChange()">
+                        <option value="text">文本字符串</option>
+                        <option value="hex">十六进制字节</option>
+                    </select>
+                </div>
+
+                <div class="form-group" id="encodingRow">
+                    <label for="encoding">文本编码：</label>
+                    <select id="encoding" name="encoding">
+                        <option value="utf-8">UTF-8</option>
+                        <option value="gbk">GBK</option>
+                        <option value="ascii">ASCII</option>
+                        <option value="latin-1">Latin-1</option>
+                    </select>
+                </div>
+
+                <div class="row">
+                    <div class="form-group">
+                        <label for="find">查找内容：</label>
+                        <textarea id="find" name="find" rows="3" placeholder="例如：1A2B3C（空格可省略）">p1+wk</textarea>
+                        <div class="hint" id="findHint">十六进制，每两个字符一个字节</div>
+                    </div>
+                    <div class="form-group">
+                        <label for="replace">替换为：</label>
+                        <textarea id="replace" name="replace" rows="3" placeholder="例如：4D5E6F（留空表示删除）">pn+wk</textarea>
+                        <div class="hint">留空可将匹配内容删除</div>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>替换范围：</label>
+                    <div class="radio-row">
+                        <label class="radio-item"><input type="radio" name="scope" value="all" checked> 替换全部</label>
+                        <label class="radio-item"><input type="radio" name="scope" value="first"> 仅替换第一处</label>
+                        <label class="radio-item"><input type="radio" name="scope" value="last"> 仅替换最后一处</label>
+                    </div>
+                </div>
+
+                <div class="btn-row">
+                    <button type="button" class="btn-secondary" onclick="countMatches()">统计匹配次数</button>
+                    <button type="submit" class="btn-primary">替换并下载</button>
+                </div>
+
+                <div id="countResult"></div>
+            </form>
+        </div>
+
+        <script>
+            function onModeChange() {
+                const mode = document.getElementById('mode').value;
+                const encRow = document.getElementById('encodingRow');
+                const find = document.getElementById('find');
+                const hint = document.getElementById('findHint');
+                if (mode === 'text') {
+                    encRow.style.display = '';
+                    find.placeholder = '要查找的文本';
+                    hint.textContent = '按所选编码转换为字节';
+                } else {
+                    encRow.style.display = 'none';
+                    find.placeholder = '例如：1A2B3C（空格可省略）';
+                    hint.textContent = '十六进制，每两个字符一个字节';
+                }
+            }
+
+            function countMatches() {
+                const form = document.getElementById('bpForm');
+                const fd = new FormData(form);
+                const resultEl = document.getElementById('countResult');
+                resultEl.style.display = 'block';
+                resultEl.innerHTML = '计算中...';
+                fetch('/binpatch/count', { method: 'POST', body: fd })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.code !== 0) {
+                            resultEl.innerHTML = '<span style="color:red;">' + d.msg + '</span>';
+                        } else {
+                            resultEl.innerHTML = '匹配到 <b>' + d.found + '</b> 处，查找内容长度 ' + d.find_len + ' 字节。'
+                                + (d.found > 0 ? ' 点击「替换并下载」生成结果文件。' : '');
+                        }
+                    })
+                    .catch(() => { resultEl.innerHTML = '<span style="color:red;">请求失败</span>'; });
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
+@app.post("/binpatch/count")
+async def binpatch_count(
+    file: UploadFile = File(...),
+    mode: str = Form(...),
+    find: str = Form(""),
+    replace: str = Form(""),
+    encoding: str = Form("utf-8"),
+):
+    try:
+        find_b, _ = parse_find_replace(find, replace, encoding, mode)
+    except (ValueError, UnicodeEncodeError) as e:
+        return JSONResponse({"code": -1, "msg": str(e)})
+    if not find_b:
+        return JSONResponse({"code": -1, "msg": "查找内容不能为空"})
+    data = await file.read()
+    found = data.count(find_b)
+    return JSONResponse({"code": 0, "found": found, "find_len": len(find_b)})
+
+
+@app.post("/binpatch/process")
+async def binpatch_process(
+    file: UploadFile = File(...),
+    mode: str = Form(...),
+    find: str = Form(""),
+    replace: str = Form(""),
+    encoding: str = Form("utf-8"),
+    scope: str = Form("all"),
+):
+    try:
+        find_b, repl_b = parse_find_replace(find, replace, encoding, mode)
+    except (ValueError, UnicodeEncodeError) as e:
+        return HTMLResponse(content=f"<p style='color:red'>错误：{escape(str(e))}</p><p><a href='/binpatch'>返回</a></p>")
+
+    data = await file.read()
+    try:
+        new_data, done = compute_patch(
+            data, find_b, repl_b,
+            first_only=(scope == "first"),
+            last_only=(scope == "last"),
+        )
+    except ValueError as e:
+        return HTMLResponse(content=f"<p style='color:red'>错误：{escape(str(e))}</p><p><a href='/binpatch'>返回</a></p>")
+
+    if done == 0:
+        return HTMLResponse(content="<p style='color:red'>未找到任何匹配内容，未生成文件。</p><p><a href='/binpatch'>返回</a></p>")
+
+    orig_name = file.filename or "file.bin"
+    out_name = orig_name
+    return Response(
+        content=new_data,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
+    )
 
 
 if __name__ == "__main__":
